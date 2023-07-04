@@ -677,8 +677,7 @@ checksum = "8a9ee70c43aaf417c914396645a0fa852624801b24ebb7ae78fe8272889ac888"
 [[package]]
 name = "hayagriva"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8a21ff266f0b113789bbf4a27da16330315eebbd7df8e844f95d29f92ad556d"
+source = "git+https://github.com/build2stone/hayagriva?branch=de#a38312846f92e491a89dc13ea5d4101bda68337f"
 dependencies = [
  "biblatex",
  "chrono",
