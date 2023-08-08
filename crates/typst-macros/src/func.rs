@@ -48,6 +48,7 @@ fn prepare(stream: TokenStream, item: &syn::ItemFn) -> Result<Func> {
     let mut params = vec![];
     for input in &sig.inputs {
         let syn::FnArg::Typed(typed) = input else {
+            println!("option a");
             bail!(input, "self is not allowed here");
         };
 
@@ -209,7 +210,12 @@ fn create(func: &Func, item: &syn::ItemFn) -> TokenStream {
 fn create_param_info(param: &Param) -> TokenStream {
     let Param { name, docs, named, variadic, ty, default, .. } = param;
     let positional = !named;
-    let required = default.is_none();
+    let required = !named && default.is_none();
+    let ty = if *variadic || (*named && default.is_none()) {
+        quote! { <#ty as ::typst::eval::Container>::Inner }
+    } else {
+        quote! { #ty }
+    };
     let default = quote_option(&default.as_ref().map(|_default| {
         quote! {
             || {
@@ -218,11 +224,6 @@ fn create_param_info(param: &Param) -> TokenStream {
             }
         }
     }));
-    let ty = if *variadic {
-        quote! { <#ty as ::typst::eval::Variadics>::Inner }
-    } else {
-        quote! { #ty }
-    };
     quote! {
         ::typst::eval::ParamInfo {
             name: #name,

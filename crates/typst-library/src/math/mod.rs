@@ -6,6 +6,7 @@ mod accent;
 mod align;
 mod attach;
 mod cancel;
+mod class;
 mod delimited;
 mod frac;
 mod fragment;
@@ -22,6 +23,7 @@ pub use self::accent::*;
 pub use self::align::*;
 pub use self::attach::*;
 pub use self::cancel::*;
+pub use self::class::*;
 pub use self::delimited::*;
 pub use self::frac::*;
 pub use self::matrix::*;
@@ -41,12 +43,13 @@ use self::ctx::*;
 use self::fragment::*;
 use self::row::*;
 use self::spacing::*;
-use crate::layout::{HElem, ParElem, Spacing};
+use crate::layout::{BoxElem, HElem, ParElem, Spacing};
 use crate::meta::Supplement;
 use crate::meta::{
     Count, Counter, CounterUpdate, LocalName, Numbering, Outlinable, Refable,
 };
 use crate::prelude::*;
+use crate::shared::BehavedBuilder;
 use crate::text::{
     families, variant, FontFamily, FontList, LinebreakElem, SpaceElem, TextElem, TextSize,
 };
@@ -104,6 +107,8 @@ pub fn module() -> Module {
     math.define("inline", inline_func());
     math.define("script", script_func());
     math.define("sscript", sscript_func());
+
+    math.define("class", ClassElem::func());
 
     // Text operators.
     math.define("op", OpElem::func());
@@ -287,9 +292,9 @@ impl Layout for EquationElem {
             }
         } else {
             let slack = ParElem::leading_in(styles) * 0.7;
-            let top_edge = TextElem::top_edge_in(styles).resolve(styles, font.metrics());
+            let top_edge = TextElem::top_edge_in(styles).resolve(styles, &font, None);
             let bottom_edge =
-                -TextElem::bottom_edge_in(styles).resolve(styles, font.metrics());
+                -TextElem::bottom_edge_in(styles).resolve(styles, &font, None);
 
             let ascent = top_edge.max(frame.ascent() - slack);
             let descent = bottom_edge.max(frame.descent() - slack);
@@ -337,6 +342,7 @@ impl LocalName for EquationElem {
             Lang::TURKISH => "Denklem",
             Lang::UKRAINIAN => "Рівняння",
             Lang::VIETNAMESE => "Phương trình",
+            Lang::JAPANESE => "式",
             Lang::ENGLISH | _ => "Equation",
         }
     }
@@ -414,7 +420,11 @@ impl LayoutMath for Content {
         }
 
         if let Some(children) = self.to_sequence() {
+            let mut bb = BehavedBuilder::new();
             for child in children {
+                bb.push(child.clone(), StyleChain::default());
+            }
+            for (child, _) in bb.finish().0.iter() {
                 child.layout_math(ctx)?;
             }
             return Ok(());
@@ -470,8 +480,12 @@ impl LayoutMath for Content {
 
         let mut frame = ctx.layout_content(self)?;
         if !frame.has_baseline() {
-            let axis = scaled!(ctx, axis_height);
-            frame.set_baseline(frame.height() / 2.0 + axis);
+            if self.is::<BoxElem>() {
+                frame.set_baseline(frame.height());
+            } else {
+                let axis = scaled!(ctx, axis_height);
+                frame.set_baseline(frame.height() / 2.0 + axis);
+            }
         }
         ctx.push(FrameFragment::new(ctx, frame).with_spaced(true));
 

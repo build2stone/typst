@@ -46,6 +46,8 @@ integers, integers cannot be smaller than `{-9223372036854775808}` or larger tha
 The number can also be specified as hexadecimal, octal, or binary by starting it
 with a zero followed by either `x`, `o`, or `b`.
 
+You can convert a value to an integer with the [`float`]($func/float) function.
+
 ## Example
 ```example
 #(1 + 2) \
@@ -64,6 +66,8 @@ A limited-precision representation of a real number. Typst uses 64 bits to
 store floats. Wherever a float is expected, you can also pass an
 [integer]($type/integer).
 
+You can convert a value to a float with the [`float`]($func/float) function.
+
 ## Example
 ```example
 #3.14 \
@@ -81,12 +85,61 @@ Typst supports the following length units:
 - Inches: `{1in}`
 - Relative to font size: `{2.5em}`
 
+A length has the following fields:
+
+- `abs`: A length with just the absolute component of the current length
+(that is, excluding the `em` component).
+- `em`: The amount of `em` units in this length, as a [float]($type/float).
+
+You can multiply lengths with and divide them by integers and floats.
+
 ## Example
 ```example
 #rect(width: 20pt)
 #rect(width: 2em)
 #rect(width: 1in)
+
+#(3em + 5pt).em
+#(20pt).em
+
+#(40em + 2pt).abs
+#(5em).abs
 ```
+
+## Methods
+### pt()
+Converts this length to points.
+
+Fails with an error if this length has non-zero `em` units (such as `5em + 2pt`
+instead of just `2pt`). Use the `abs` field (such as in `(5em + 2pt).abs.pt()`)
+to ignore the `em` component of the length (thus converting only its absolute
+component).
+
+- returns: float
+
+### mm()
+Converts this length to millimeters.
+
+Fails with an error if this length has non-zero `em` units (such as `5em + 2pt`
+instead of just `2pt`). See the [`pt`]($type/float.pt) method for more info.
+
+- returns: float
+
+### cm()
+Converts this length to centimeters.
+
+Fails with an error if this length has non-zero `em` units (such as `5em + 2pt`
+instead of just `2pt`). See the [`pt`]($type/float.pt) method for more info.
+
+- returns: float
+
+### inches()
+Converts this length to inches.
+
+Fails with an error if this length has non-zero `em` units (such as `5em + 2pt`
+instead of just `2pt`). See the [`pt`]($type/float.pt) method for more info.
+
+- returns: float
 
 # Angle
 An angle describing a rotation.
@@ -99,6 +152,17 @@ Typst supports the following angular units:
 ```example
 #rotate(10deg)[Hello there!]
 ```
+
+## Methods
+### deg()
+Converts this angle to degrees.
+
+- returns: float
+
+### rad()
+Converts this angle to radians.
+
+- returns: float
 
 # Ratio
 A ratio of a whole.
@@ -121,9 +185,16 @@ This type is a combination of a [length]($type/length) with a
 of a length and a ratio. Wherever a relative length is expected, you can also
 use a bare length or ratio.
 
+A relative length has the following fields:
+- `length`: Its length component.
+- `ratio`: Its ratio component.
+
 ## Example
 ```example
 #rect(width: 100% - 50pt)
+
+#(100% - 50pt).length
+#(100% - 50pt).ratio
 ```
 
 # Fraction
@@ -155,6 +226,17 @@ Furthermore, Typst provides the following built-in colors:
 `lime`.
 
 ## Methods
+### kind()
+Returns the constructor function for this color's kind
+([`rgb`]($func/rgb), [`cmyk`]($func/cmyk) or [`luma`]($func/luma)).
+
+```example
+#let color = cmyk(1%, 2%, 3%, 4%)
+#(color.kind() == cmyk)
+```
+
+- returns: function
+
 ### lighten()
 Lightens a color.
 
@@ -173,6 +255,34 @@ Darkens a color.
 Produces the negative of the color.
 
 - returns: color
+
+### hex()
+Returns the color's RGB(A) hex representation (such as `#ffaa32` or `#020304fe`).
+The alpha component (last two digits in `#020304fe`) is omitted if it is equal
+to `ff` (255 / 100%).
+
+- returns: string
+
+### rgba()
+Converts this color to sRGB and returns its components (R, G, B, A) as an array
+of [integers]($type/integer).
+
+- returns: array
+
+### cmyk()
+Converts this color to Digital CMYK and returns its components (C, M, Y, K) as
+an array of [ratios]($type/ratio). Note that this function will throw an error
+when applied to an [rgb]($func/rgb) color, since its conversion to CMYK is not
+available.
+
+- returns: array
+
+### luma()
+If this color was created with [luma]($func/luma), returns the [integer]($type/integer)
+value used on construction. Otherwise (for [rgb]($func/rgb) and [cmyk]($func/cmyk) colors),
+throws an error.
+
+- returns: integer
 
 # Datetime
 Represents a date, a time, or a combination of both. Can be created by either
@@ -352,6 +462,65 @@ $arrow.r$ \
 $arrow.t.quad$
 ```
 
+# Bytes
+A sequence of bytes.
+
+This is conceptually similar to an array of [integers]($type/integer) between
+`{0}` and `{255}`, but represented much more efficiently.
+
+You can convert
+- a [string]($type/string) or an [array]($type/array) of integers to bytes with
+  the [`bytes`]($func/bytes) function
+- bytes to a string with the [`str`]($func/str) function
+- bytes to an array of integers with the [`array`]($func/array) function
+
+When [reading]($func/read) data from a file, you can decide whether to load it
+as a string or as raw bytes.
+
+```example
+#bytes((123, 160, 22, 0)) \
+#bytes("Hello 😃")
+
+#let data = read(
+  "rhino.png",
+  encoding: none,
+)
+
+// Magic bytes.
+#array(data.slice(0, 4)) \
+#str(data.slice(1, 4))
+```
+
+## Methods
+### len()
+The length in bytes.
+
+- returns: integer
+
+### at()
+Returns the byte at the specified index. Returns the default value if the index
+is out of bounds or fails with an error if no default value was specified.
+
+- index: integer (positional, required)
+  The index at which to retrieve the byte.
+- default: any (named)
+  A default value to return if the index is out of bounds.
+- returns: integer or any
+
+### slice()
+Extract a subslice of the bytes.
+Fails with an error if the start or index is out of bounds.
+
+- start: integer (positional, required)
+  The start index (inclusive).
+- end: integer (positional)
+  The end index (exclusive). If omitted, the whole slice until the end is
+  extracted.
+- count: integer (named)
+  The number of bytes to extract. This is equivalent to passing
+  `start + count` as the `end` position. Mutually exclusive with `end`.
+- returns: bytes
+
 # String
 A sequence of Unicode codepoints.
 
@@ -368,6 +537,8 @@ quite versatile.
 
 All lengths and indices are expressed in terms of UTF-8 characters. Indices are
 zero-based and negative indices wrap around to the end of the string.
+
+You can convert a value to a string with the [`str`]($func/str) function.
 
 ### Example
 ```example
@@ -415,7 +586,7 @@ value was specified.
   The byte index.
 - default: any (named)
   A default value to return if the index is out of bounds.
-- returns: string
+- returns: string or any
 
 ### slice()
 Extract a substring of the string.
@@ -620,6 +791,8 @@ Return the fields of this content.
 ).fields()
 ```
 
+- returns: dictionary
+
 ### location()
 The location of the content. This is only available on content returned by
 [query]($func/query), for other content it will fail with an error. The
@@ -731,8 +904,8 @@ Fails with an error if the start or index is out of bounds.
   The end index (exclusive). If omitted, the whole slice until the end of the
   array is extracted.
 - count: integer (named)
-  The number of items to extract. This is equivalent to passing `start +
-  count` as the `end` position. Mutually exclusive with `end`.
+  The number of items to extract. This is equivalent to passing
+  `start + count` as the `end` position. Mutually exclusive with `end`.
 - returns: array
 
 ### contains()
@@ -784,6 +957,9 @@ The returned array consists of `(index, value)` pairs in the form of length-2
 arrays. These can be [destructured]($scripting/#bindings) with a let binding or
 for loop.
 
+- start: integer (named)
+  The index returned for the first pair of the returned list.
+  Defaults to `{0}`.
 - returns: array
 
 ### zip()
@@ -858,6 +1034,21 @@ Return a new array with the same items, but sorted.
 
 - key: function (named)
   If given, applies this function to the elements in the array to determine the keys to sort by.
+- returns: array
+
+### dedup()
+Returns a new array with all duplicate items removed.
+
+Only the first element of each duplicate is kept.
+
+```example
+#{
+  (1, 1, 2, 3, 1).dedup() == (1, 2, 3)
+}
+```
+
+- key: function (named)
+  If given, applies this function to the elements in the array to determine the keys to deduplicate by.
 - returns: array
 
 # Dictionary
@@ -1066,24 +1257,34 @@ whose fields have the values of the given arguments.
 # Arguments
 Captured arguments to a function.
 
+## Argument Sinks
 Like built-in functions, custom functions can also take a variable number of
 arguments. You can specify an _argument sink_ which collects all excess
 arguments as `..sink`. The resulting `sink` value is of the `arguments` type. It
-exposes methods to access the positional and named arguments and is iterable
-with a [for loop]($scripting/#loops). Inversely, you can spread
-arguments, arrays and dictionaries into a function call with the spread operator:
-`{func(..args)}`.
+exposes methods to access the positional and named arguments.
 
-## Example
 ```example
-#let format(title, ..authors) = [
-  *#title* \
-  _Written by #(authors
+#let format(title, ..authors) = {
+  let by = authors
     .pos()
-    .join(", ", last: " and "));._
-]
+    .join(", ", last: " and ")
+
+  [*#title* \ _Written by #by;_]
+}
 
 #format("ArtosFlow", "Jane", "Joe")
+```
+
+## Spreading
+Inversely to an argument sink, you can _spread_ arguments, arrays and
+dictionaries into a function call with the `..spread` operator:
+
+```example
+#let array = (2, 3, 5)
+#calc.min(..array)
+
+#let dict = (fill: blue)
+#text(..dict)[Hello]
 ```
 
 ## Methods

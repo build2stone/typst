@@ -338,6 +338,12 @@ impl Frame {
 impl Frame {
     /// Add a full size aqua background and a red baseline for debugging.
     pub fn debug(mut self) -> Self {
+        self.debug_in_place();
+        self
+    }
+
+    /// Debug in place.
+    pub fn debug_in_place(&mut self) {
         self.insert(
             0,
             Point::zero(),
@@ -359,7 +365,6 @@ impl Frame {
                 Span::detached(),
             ),
         );
-        self
     }
 
     /// Add a green marker at a position for debugging.
@@ -507,6 +512,45 @@ impl Glyph {
     pub fn range(&self) -> Range<usize> {
         usize::from(self.range.start)..usize::from(self.range.end)
     }
+}
+
+/// An ISO 15924-type script identifier
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct WritingScript([u8; 4], u8);
+
+impl WritingScript {
+    /// Return the script as an all lowercase string slice.
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.0[..usize::from(self.1)]).unwrap_or_default()
+    }
+
+    /// Return the description of the script as raw bytes.
+    pub fn as_bytes(&self) -> &[u8; 4] {
+        &self.0
+    }
+}
+
+impl FromStr for WritingScript {
+    type Err = &'static str;
+
+    /// Construct a region from its ISO 15924 code.
+    fn from_str(iso: &str) -> Result<Self, Self::Err> {
+        let len = iso.len();
+        if matches!(len, 3..=4) && iso.is_ascii() {
+            let mut bytes = [b' '; 4];
+            bytes[..len].copy_from_slice(iso.as_bytes());
+            bytes.make_ascii_lowercase();
+            Ok(Self(bytes, len as u8))
+        } else {
+            Err("expected three or four letter script code (ISO 15924 or 'math')")
+        }
+    }
+}
+
+cast! {
+    WritingScript,
+    self => self.as_str().into_value(),
+    string: EcoString => Self::from_str(&string)?,
 }
 
 /// An identifier for a natural language.

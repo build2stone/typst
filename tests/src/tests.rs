@@ -17,17 +17,16 @@ use oxipng::{InFile, Options, OutFile};
 use rayon::iter::{ParallelBridge, ParallelIterator};
 use std::cell::OnceCell;
 use tiny_skia as sk;
-use typst::file::FileId;
 use unscanny::Scanner;
 use walkdir::WalkDir;
 
-use typst::diag::{bail, FileError, FileResult, StrResult};
+use typst::diag::{bail, FileError, FileResult, Severity, StrResult};
 use typst::doc::{Document, Frame, FrameItem, Meta};
-use typst::eval::{eco_format, func, Datetime, Library, NoneValue, Value};
+use typst::eval::{eco_format, func, Bytes, Datetime, Library, NoneValue, Tracer, Value};
 use typst::font::{Font, FontBook};
 use typst::geom::{Abs, Color, RgbaColor, Smart};
-use typst::syntax::{Source, Span, SyntaxNode};
-use typst::util::{Bytes, PathExt};
+use typst::syntax::{FileId, Source, Span, SyntaxNode};
+use typst::util::PathExt;
 use typst::World;
 use typst_library::layout::{Margin, PageElem};
 use typst_library::text::{TextElem, TextSize};
@@ -36,6 +35,7 @@ const TYP_DIR: &str = "typ";
 const REF_DIR: &str = "ref";
 const PNG_DIR: &str = "png";
 const PDF_DIR: &str = "pdf";
+const SVG_DIR: &str = "svg";
 const FONT_DIR: &str = "../assets/fonts";
 const ASSET_DIR: &str = "../assets";
 
@@ -117,11 +117,19 @@ fn main() {
             let path = src_path.strip_prefix(TYP_DIR).unwrap();
             let png_path = Path::new(PNG_DIR).join(path).with_extension("png");
             let ref_path = Path::new(REF_DIR).join(path).with_extension("png");
+            let svg_path = Path::new(SVG_DIR).join(path).with_extension("svg");
             let pdf_path =
                 args.pdf.then(|| Path::new(PDF_DIR).join(path).with_extension("pdf"));
 
-            test(world, &src_path, &png_path, &ref_path, pdf_path.as_deref(), &args)
-                as usize
+            test(
+                world,
+                &src_path,
+                &png_path,
+                &ref_path,
+                pdf_path.as_deref(),
+                &svg_path,
+                &args,
+            ) as usize
         })
         .collect::<Vec<_>>();
 
@@ -329,6 +337,7 @@ fn test(
     png_path: &Path,
     ref_path: &Path,
     pdf_path: Option<&Path>,
+    svg_path: &Path,
     args: &Args,
 ) -> bool {
     struct PanicGuard<'a>(&'a Path);
@@ -419,6 +428,10 @@ fn test(
         let canvas = render(&document.pages);
         fs::create_dir_all(png_path.parent().unwrap()).unwrap();
         canvas.save_png(png_path).unwrap();
+
+        let svg = typst::export::svg_merged(&document.pages, Abs::pt(5.0));
+        fs::create_dir_all(svg_path.parent().unwrap()).unwrap();
+        std::fs::write(svg_path, svg).unwrap();
 
         if let Ok(ref_pixmap) = sk::Pixmap::load_png(ref_path) {
             if canvas.width() != ref_pixmap.width()
@@ -515,51 +528,63 @@ fn test_part(
         let world = (world as &dyn World).track();
         let route = typst::eval::Route::default();
         let mut tracer = typst::eval::Tracer::default();
+
         let module =
             typst::eval::eval(world, route.track(), tracer.track_mut(), &source).unwrap();
         writeln!(output, "Model:\n{:#?}\n", module.content()).unwrap();
     }
 
-    let (mut frames, errors) = match typst::compile(world) {
-        Ok(document) => (document.pages, vec![]),
-        Err(errors) => (vec![], *errors),
+    let mut tracer = Tracer::default();
+
+    let (mut frames, diagnostics) = match typst::compile(world, &mut tracer) {
+        Ok(document) => (document.pages, tracer.warnings()),
+        Err(errors) => {
+            let mut warnings = tracer.warnings();
+            warnings.extend(*errors);
+            (vec![], warnings)
+        }
     };
 
-    // Don't retain frames if we don't wanna compare with reference images.
+    // Don't retain frames if we don't want to compare with reference images.
     if !compare_ref {
         frames.clear();
     }
 
-    // Map errors to range and message format, discard traces and errors from
+    // Map diagnostics to range and message format, discard traces and errors from
     // other files, collect hints.
     //
     // This has one caveat: due to the format of the expected hints, we can not
-    // verify if a hint belongs to a error or not. That should be irrelevant
+    // verify if a hint belongs to a diagnostic or not. That should be irrelevant
     // however, as the line of the hint is still verified.
-    let actual_errors_and_hints: HashSet<UserOutput> = errors
+    let actual_diagnostics: HashSet<UserOutput> = diagnostics
         .into_iter()
-        .inspect(|error| assert!(!error.span.is_detached()))
-        .filter(|error| error.span.id() == source.id())
-        .flat_map(|error| {
-            let range = error.span.range(world);
-            let output_error =
-                UserOutput::Error(range.clone(), error.message.replace('\\', "/"));
-            let hints = error
+        .inspect(|diagnostic| assert!(!diagnostic.span.is_detached()))
+        .filter(|diagnostic| diagnostic.span.id() == source.id())
+        .flat_map(|diagnostic| {
+            let range = world.range(diagnostic.span);
+            let message = diagnostic.message.replace('\\', "/");
+            let output = match diagnostic.severity {
+                Severity::Error => UserOutput::Error(range.clone(), message),
+                Severity::Warning => UserOutput::Warning(range.clone(), message),
+            };
+
+            let hints = diagnostic
                 .hints
                 .iter()
                 .filter(|_| validate_hints) // No unexpected hints should be verified if disabled.
                 .map(|hint| UserOutput::Hint(range.clone(), hint.to_string()));
-            iter::once(output_error).chain(hints).collect::<Vec<_>>()
+
+            iter::once(output).chain(hints).collect::<Vec<_>>()
         })
         .collect();
 
     // Basically symmetric_difference, but we need to know where an item is coming from.
-    let mut unexpected_outputs = actual_errors_and_hints
+    let mut unexpected_outputs = actual_diagnostics
         .difference(&metadata.invariants)
         .collect::<Vec<_>>();
     let mut missing_outputs = metadata
         .invariants
-        .difference(&actual_errors_and_hints)
+        .difference(&actual_diagnostics)
         .collect::<Vec<_>>();
 
     unexpected_outputs.sort_by_key(|&o| o.start());
@@ -593,6 +618,7 @@ fn print_user_output(
 ) {
     let (range, message) = match &user_output {
         UserOutput::Error(r, m) => (r, m),
+        UserOutput::Warning(r, m) => (r, m),
         UserOutput::Hint(r, m) => (r, m),
     };
 
@@ -602,6 +628,7 @@ fn print_user_output(
     let end_col = 1 + source.byte_to_column(range.end).unwrap();
     let kind = match user_output {
         UserOutput::Error(_, _) => "Error",
+        UserOutput::Warning(_, _) => "Warning",
         UserOutput::Hint(_, _) => "Hint",
     };
     writeln!(output, "{kind}: {start_line}:{start_col}-{end_line}:{end_col}: {message}")
@@ -621,6 +648,7 @@ struct TestPartMetadata {
 #[derive(PartialEq, Eq, Debug, Hash)]
 enum UserOutput {
     Error(Range<usize>, String),
+    Warning(Range<usize>, String),
     Hint(Range<usize>, String),
 }
 
@@ -628,12 +656,17 @@ impl UserOutput {
     fn start(&self) -> usize {
         match self {
             UserOutput::Error(r, _) => r.start,
+            UserOutput::Warning(r, _) => r.start,
             UserOutput::Hint(r, _) => r.start,
         }
     }
 
     fn error(range: Range<usize>, message: String) -> UserOutput {
         UserOutput::Error(range, message)
+    }
+
+    fn warning(range: Range<usize>, message: String) -> UserOutput {
+        UserOutput::Warning(range, message)
     }
 
     fn hint(range: Range<usize>, message: String) -> UserOutput {
@@ -651,8 +684,14 @@ fn parse_part_metadata(source: &Source) -> TestPartMetadata {
         compare_ref = get_flag_metadata(line, "Ref").or(compare_ref);
         validate_hints = get_flag_metadata(line, "Hints").or(validate_hints);
 
-        fn num(s: &mut Scanner) -> usize {
-            s.eat_while(char::is_numeric).parse().unwrap()
+        fn num(s: &mut Scanner) -> isize {
+            let mut first = true;
+            let n = &s.eat_while(|c: char| {
+                let valid = first && c == '-' || c.is_numeric();
+                first = false;
+                valid
+            });
+            n.parse().unwrap_or_else(|e| panic!("{n} is not a number ({e})"))
         }
 
         let comments_until_code =
@@ -662,17 +701,30 @@ fn parse_part_metadata(source: &Source) -> TestPartMetadata {
             let first = num(s) - 1;
             let (delta, column) =
                 if s.eat_if(':') { (first, num(s) - 1) } else { (0, first) };
-            let line = (i + comments_until_code) + delta;
-            source.line_column_to_byte(line, column).unwrap()
+            let line = (i + comments_until_code)
+                .checked_add_signed(delta)
+                .expect("line number overflowed limits");
+            source
+                .line_column_to_byte(
+                    line,
+                    usize::try_from(column).expect("column number overflowed limits"),
+                )
+                .unwrap()
         };
 
         let error_factory: fn(Range<usize>, String) -> UserOutput = UserOutput::error;
+        let warning_factory: fn(Range<usize>, String) -> UserOutput = UserOutput::warning;
         let hint_factory: fn(Range<usize>, String) -> UserOutput = UserOutput::hint;
 
         let error_metadata = get_metadata(line, "Error").map(|s| (s, error_factory));
+        let get_warning_metadata =
+            || get_metadata(line, "Warning").map(|s| (s, warning_factory));
         let get_hint_metadata = || get_metadata(line, "Hint").map(|s| (s, hint_factory));
 
-        if let Some((expectation, factory)) = error_metadata.or_else(get_hint_metadata) {
+        if let Some((expectation, factory)) = error_metadata
+            .or_else(get_warning_metadata)
+            .or_else(get_hint_metadata)
+        {
             let mut s = Scanner::new(expectation);
             let start = pos(&mut s);
             let end = if s.eat_if('-') { pos(&mut s) } else { start };
@@ -846,42 +898,33 @@ fn test_spans_impl(output: &mut String, node: &SyntaxNode, within: Range<u64>) -
 /// Draw all frames into one image with padding in between.
 fn render(frames: &[Frame]) -> sk::Pixmap {
     let pixel_per_pt = 2.0;
-    let pixmaps: Vec<_> = frames
-        .iter()
-        .map(|frame| {
-            let limit = Abs::cm(100.0);
-            if frame.width() > limit || frame.height() > limit {
-                panic!("overlarge frame: {:?}", frame.size());
-            }
-            typst::export::render(frame, pixel_per_pt, Color::WHITE)
-        })
-        .collect();
+    let padding = Abs::pt(5.0);
 
-    let pad = (5.0 * pixel_per_pt).round() as u32;
-    let pxw = 2 * pad + pixmaps.iter().map(sk::Pixmap::width).max().unwrap_or_default();
-    let pxh = pad + pixmaps.iter().map(|pixmap| pixmap.height() + pad).sum::<u32>();
-
-    let mut canvas = sk::Pixmap::new(pxw, pxh).unwrap();
-    canvas.fill(sk::Color::BLACK);
-
-    let [x, mut y] = [pad; 2];
-    for (frame, mut pixmap) in frames.iter().zip(pixmaps) {
-        let ts = sk::Transform::from_scale(pixel_per_pt, pixel_per_pt);
-        render_links(&mut pixmap, ts, frame);
-
-        canvas.draw_pixmap(
-            x as i32,
-            y as i32,
-            pixmap.as_ref(),
-            &sk::PixmapPaint::default(),
-            sk::Transform::identity(),
-            None,
-        );
-
-        y += pixmap.height() + pad;
+    for frame in frames {
+        let limit = Abs::cm(100.0);
+        if frame.width() > limit || frame.height() > limit {
+            panic!("overlarge frame: {:?}", frame.size());
+        }
     }
 
-    canvas
+    let mut pixmap = typst::export::render_merged(
+        frames,
+        pixel_per_pt,
+        Color::WHITE,
+        padding,
+        Color::BLACK,
+    );
+
+    let padding = (pixel_per_pt * padding.to_pt() as f32).round();
+    let [x, mut y] = [padding; 2];
+    for frame in frames {
+        let ts =
+            sk::Transform::from_scale(pixel_per_pt, pixel_per_pt).post_translate(x, y);
+        render_links(&mut pixmap, ts, frame);
+        y += (pixel_per_pt * frame.height().to_pt() as f32).round().max(1.0) + padding;
+    }
+
+    pixmap
 }
 
 /// Draw extra boxes for links so we can see whether they are there.

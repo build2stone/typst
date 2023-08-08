@@ -238,6 +238,30 @@
 #test(((1, 2), 3).zip((4, 5)), (((1, 2), 4), (3, 5)))
 #test((1, "hi").zip((true, false)), ((1, true), ("hi", false)))
 
+---
+// Test the `enumerate` method.
+#test(().enumerate(), ())
+#test(().enumerate(start: 5), ())
+#test(("a", "b", "c").enumerate(), ((0, "a"), (1, "b"), (2, "c")))
+#test(("a", "b", "c").enumerate(start: 1), ((1, "a"), (2, "b"), (3, "c")))
+#test(("a", "b", "c").enumerate(start: 42), ((42, "a"), (43, "b"), (44, "c")))
+#test(("a", "b", "c").enumerate(start: -7), ((-7, "a"), (-6, "b"), (-5, "c")))
+
+---
+// Test the `dedup` method.
+#test(().dedup(), ())
+#test((1,).dedup(), (1,))
+#test((1, 1).dedup(), (1,))
+#test((1, 2, 1).dedup(), (1, 2))
+#test(("Jane", "John", "Eric").dedup(), ("Jane", "John", "Eric"))
+#test(("Jane", "John", "Eric", "John").dedup(), ("Jane", "John", "Eric"))
+
+---
+// Test the `dedup` with the `key` argument.
+#test((1, 2, 3, 4, 5, 6).dedup(key: x => calc.rem(x, 2)), (1, 2))
+#test((1, 2, 3, 4, 5, 6).dedup(key: x => calc.rem(x, 3)), (1, 2, 3))
+#test(("Hello", "World", "Hi", "There").dedup(key: x => x.len()), ("Hello", "Hi"))
+#test(("Hello", "World", "Hi", "There").dedup(key: x => x.at(0)), ("Hello", "World", "There"))
 
 ---
 // Error: 32-37 cannot divide by zero

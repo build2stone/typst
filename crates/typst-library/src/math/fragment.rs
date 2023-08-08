@@ -1,5 +1,10 @@
+use rustybuzz::Feature;
+use ttf_parser::gsub::{
+    AlternateSet, AlternateSubstitution, SingleSubstitution, SubstitutionSubtable,
+};
+use ttf_parser::opentype_layout::LayoutTable;
+
 use super::*;
-use ttf_parser::gsub::AlternateSet;
 
 #[derive(Debug, Clone)]
 pub enum MathFragment {
@@ -56,12 +61,12 @@ impl MathFragment {
     }
 
     pub fn class(&self) -> Option<MathClass> {
-        match self {
+        self.style().and_then(|style| style.class.as_custom()).or(match self {
             Self::Glyph(glyph) => glyph.class,
             Self::Variant(variant) => variant.class,
             Self::Frame(fragment) => Some(fragment.class),
             _ => None,
-        }
+        })
     }
 
     pub fn style(&self) -> Option<MathStyle> {
@@ -83,10 +88,27 @@ impl MathFragment {
     }
 
     pub fn set_class(&mut self, class: MathClass) {
+        macro_rules! set_style_class {
+            ($fragment:ident) => {
+                if $fragment.style.class.is_custom() {
+                    $fragment.style.class = Smart::Custom(class);
+                }
+            };
+        }
+
         match self {
-            Self::Glyph(glyph) => glyph.class = Some(class),
-            Self::Variant(variant) => variant.class = Some(class),
-            Self::Frame(fragment) => fragment.class = class,
+            Self::Glyph(glyph) => {
+                glyph.class = Some(class);
+                set_style_class!(glyph);
+            }
+            Self::Variant(variant) => {
+                variant.class = Some(class);
+                set_style_class!(variant);
+            }
+            Self::Frame(fragment) => {
+                fragment.class = class;
+                set_style_class!(fragment);
+            }
             _ => {}
         }
     }
@@ -102,7 +124,13 @@ impl MathFragment {
 
     pub fn is_spaced(&self) -> bool {
         match self {
-            MathFragment::Frame(frame) => frame.spaced,
+            MathFragment::Frame(frame) => {
+                match self.style().and_then(|style| style.class.as_custom()) {
+                    Some(MathClass::Fence) => true,
+                    Some(_) => false,
+                    None => frame.spaced,
+                }
+            }
             _ => self.class() == Some(MathClass::Fence),
         }
     }
@@ -174,18 +202,21 @@ pub struct GlyphFragment {
 impl GlyphFragment {
     pub fn new(ctx: &MathContext, c: char, span: Span) -> Self {
         let id = ctx.ttf.glyph_index(c).unwrap_or_default();
+        let id = Self::adjust_glyph_index(ctx, id);
         Self::with_id(ctx, c, id, span)
     }
 
     pub fn try_new(ctx: &MathContext, c: char, span: Span) -> Option<Self> {
         let c = ctx.style.styled_char(c);
         let id = ctx.ttf.glyph_index(c)?;
+        let id = Self::adjust_glyph_index(ctx, id);
         Some(Self::with_id(ctx, c, id, span))
     }
 
     pub fn with_id(ctx: &MathContext, c: char, id: GlyphId, span: Span) -> Self {
         let class = match c {
             ':' => Some(MathClass::Relation),
+            '.' | '/' | '⋯' | '⋱' | '⋰' | '⋮' => Some(MathClass::Normal),
             _ => unicode_math_class::class(c),
         };
         let mut fragment = Self {
@@ -207,6 +238,15 @@ impl GlyphFragment {
         };
         fragment.set_id(ctx, id);
         fragment
+    }
+
+    /// Apply GSUB substitutions.
+    fn adjust_glyph_index(ctx: &MathContext, id: GlyphId) -> GlyphId {
+        if let Some(glyphwise_tables) = &ctx.glyphwise_tables {
+            glyphwise_tables.iter().fold(id, |id, table| table.apply(id))
+        } else {
+            id
+        }
     }
 
     /// Sets element id and boxes in appropriate way without changing other
@@ -313,6 +353,15 @@ pub struct VariantFragment {
     pub limits: Limits,
 }
 
+impl VariantFragment {
+    /// Vertically adjust the fragment's frame so that it is centered
+    /// on the axis.
+    pub fn center_on_axis(&mut self, ctx: &MathContext) {
+        let h = self.frame.height();
+        self.frame.set_baseline(h / 2.0 + scaled!(ctx, axis_height));
+    }
+}
+
 impl Debug for VariantFragment {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "VariantFragment({:?})", self.c)
@@ -411,4 +460,52 @@ fn kern_at_height(
     }
 
     Some(kern.kern(i)?.scaled(ctx))
+}
+
+/// An OpenType substitution table that is applicable to glyph-wise substitutions.
+pub enum GlyphwiseSubsts<'a> {
+    Single(SingleSubstitution<'a>),
+    Alternate(AlternateSubstitution<'a>, u32),
+}
+
+impl<'a> GlyphwiseSubsts<'a> {
+    pub fn new(gsub: LayoutTable<'a>, feature: Feature) -> Option<Self> {
+        let table = gsub
+            .features
+            .find(feature.tag)
+            .and_then(|feature| feature.lookup_indices.get(0))
+            .and_then(|index| gsub.lookups.get(index))?;
+        let table = table.subtables.get::<SubstitutionSubtable>(0)?;
+        match table {
+            SubstitutionSubtable::Single(single_glyphs) => {
+                Some(Self::Single(single_glyphs))
+            }
+            SubstitutionSubtable::Alternate(alt_glyphs) => {
+                Some(Self::Alternate(alt_glyphs, feature.value))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn try_apply(&self, glyph_id: GlyphId) -> Option<GlyphId> {
+        match self {
+            Self::Single(single) => match single {
+                SingleSubstitution::Format1 { coverage, delta } => coverage
+                    .get(glyph_id)
+                    .map(|_| GlyphId(glyph_id.0.wrapping_add(*delta as u16))),
+                SingleSubstitution::Format2 { coverage, substitutes } => {
+                    coverage.get(glyph_id).and_then(|idx| substitutes.get(idx))
+                }
+            },
+            Self::Alternate(alternate, value) => alternate
+                .coverage
+                .get(glyph_id)
+                .and_then(|idx| alternate.alternate_sets.get(idx))
+                .and_then(|set| set.alternates.get(*value as u16)),
+        }
+    }
+
+    pub fn apply(&self, glyph_id: GlyphId) -> GlyphId {
+        self.try_apply(glyph_id).unwrap_or(glyph_id)
+    }
 }

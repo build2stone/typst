@@ -11,8 +11,6 @@ use unscanny::Scanner;
 use super::{
     is_id_continue, is_id_start, is_newline, split_newlines, Span, SyntaxKind, SyntaxNode,
 };
-use crate::geom::{AbsUnit, AngleUnit};
-use crate::util::NonZeroExt;
 
 /// A typed AST node.
 pub trait AstNode: Sized {
@@ -124,6 +122,8 @@ pub enum Expr {
     MathDelimited(MathDelimited),
     /// A base with optional attachments in math: `a_1^2`.
     MathAttach(MathAttach),
+    /// Grouped math primes
+    MathPrimes(MathPrimes),
     /// A fraction in math: `x/2`.
     MathFrac(MathFrac),
     /// A root in math: `√x`, `∛x` or `∜x`.
@@ -224,6 +224,7 @@ impl AstNode for Expr {
             SyntaxKind::MathAlignPoint => node.cast().map(Self::MathAlignPoint),
             SyntaxKind::MathDelimited => node.cast().map(Self::MathDelimited),
             SyntaxKind::MathAttach => node.cast().map(Self::MathAttach),
+            SyntaxKind::MathPrimes => node.cast().map(Self::MathPrimes),
             SyntaxKind::MathFrac => node.cast().map(Self::MathFrac),
             SyntaxKind::MathRoot => node.cast().map(Self::MathRoot),
             SyntaxKind::Ident => node.cast().map(Self::Ident),
@@ -285,6 +286,7 @@ impl AstNode for Expr {
             Self::MathAlignPoint(v) => v.as_untyped(),
             Self::MathDelimited(v) => v.as_untyped(),
             Self::MathAttach(v) => v.as_untyped(),
+            Self::MathPrimes(v) => v.as_untyped(),
             Self::MathFrac(v) => v.as_untyped(),
             Self::MathRoot(v) => v.as_untyped(),
             Self::Ident(v) => v.as_untyped(),
@@ -433,16 +435,18 @@ node! {
 }
 
 impl Shorthand {
-    /// A list of all shorthands.
-    pub const LIST: &[(&'static str, char)] = &[
-        // Both.
+    /// A list of all shorthands in markup mode.
+    pub const MARKUP_LIST: &[(&'static str, char)] = &[
         ("...", '…'),
-        // Text only.
         ("~", '\u{00A0}'),
         ("--", '\u{2013}'),
         ("---", '\u{2014}'),
         ("-?", '\u{00AD}'),
-        // Math only.
+    ];
+
+    /// A list of all shorthands in math mode.
+    pub const MATH_LIST: &[(&'static str, char)] = &[
+        ("...", '…'),
         ("-", '\u{2212}'),
         ("'", '′'),
         ("*", '∗'),
@@ -485,8 +489,7 @@ impl Shorthand {
     /// Get the shorthanded character.
     pub fn get(&self) -> char {
         let text = self.0.text();
-        Self::LIST
-            .iter()
+        (Self::MARKUP_LIST.iter().chain(Self::MATH_LIST))
             .find(|&&(s, _)| s == text)
             .map_or_else(char::default, |&(_, c)| c)
     }
@@ -561,6 +564,9 @@ impl Raw {
             let dedent = lines
                 .iter()
                 .skip(1)
+                .filter(|line| !line.chars().all(char::is_whitespace))
+                // The line with the closing ``` is always taken into account
+                .chain(lines.last())
                 .map(|line| line.chars().take_while(|c| c.is_whitespace()).count())
                 .min()
                 .unwrap_or(0);
@@ -673,7 +679,7 @@ impl Heading {
             .children()
             .find(|node| node.kind() == SyntaxKind::HeadingMarker)
             .and_then(|node| node.len().try_into().ok())
-            .unwrap_or(NonZeroUsize::ONE)
+            .unwrap_or(NonZeroUsize::new(1).unwrap())
     }
 }
 
@@ -841,6 +847,25 @@ impl MathAttach {
             .skip_while(|node| !matches!(node.kind(), SyntaxKind::Hat))
             .find_map(SyntaxNode::cast)
     }
+
+    /// Extract primes if present.
+    pub fn primes(&self) -> Option<MathPrimes> {
+        self.0.cast_first_match()
+    }
+}
+
+node! {
+    /// Grouped primes in math: `a'''`.
+    MathPrimes
+}
+
+impl MathPrimes {
+    pub fn count(&self) -> usize {
+        self.0
+            .children()
+            .filter(|node| matches!(node.kind(), SyntaxKind::Prime))
+            .count()
+    }
 }
 
 node! {
@@ -986,12 +1011,12 @@ impl Numeric {
         let split = text.len() - count;
         let value = text[..split].parse().unwrap_or_default();
         let unit = match &text[split..] {
-            "pt" => Unit::Length(AbsUnit::Pt),
-            "mm" => Unit::Length(AbsUnit::Mm),
-            "cm" => Unit::Length(AbsUnit::Cm),
-            "in" => Unit::Length(AbsUnit::In),
-            "deg" => Unit::Angle(AngleUnit::Deg),
-            "rad" => Unit::Angle(AngleUnit::Rad),
+            "pt" => Unit::Pt,
+            "mm" => Unit::Mm,
+            "cm" => Unit::Cm,
+            "in" => Unit::In,
+            "deg" => Unit::Deg,
+            "rad" => Unit::Rad,
             "em" => Unit::Em,
             "fr" => Unit::Fr,
             "%" => Unit::Percent,
@@ -1005,10 +1030,18 @@ impl Numeric {
 /// Unit of a numeric value.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub enum Unit {
-    /// An absolute length unit.
-    Length(AbsUnit),
-    /// An angular unit.
-    Angle(AngleUnit),
+    /// Points.
+    Pt,
+    /// Millimeters.
+    Mm,
+    /// Centimeters.
+    Cm,
+    /// Inches.
+    In,
+    /// Radians.
+    Rad,
+    /// Degrees.
+    Deg,
     /// Font-relative: `1em` is the same as the font size.
     Em,
     /// Fractions: `fr`.

@@ -4,12 +4,11 @@ use std::path::Path;
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use codespan_reporting::term::{self, termcolor};
 use termcolor::{ColorChoice, StandardStream};
-use typst::diag::{bail, SourceError, StrResult};
+use typst::diag::{bail, Severity, SourceDiagnostic, StrResult};
 use typst::doc::Document;
-use typst::eval::eco_format;
-use typst::file::FileId;
+use typst::eval::{eco_format, Tracer};
 use typst::geom::Color;
-use typst::syntax::Source;
+use typst::syntax::{FileId, Source};
 use typst::World;
 
 use crate::args::{CompileCommand, DiagnosticFormat};
@@ -22,7 +21,7 @@ type CodespanError = codespan_reporting::files::Error;
 
 /// Execute a compilation command.
 pub fn compile(mut command: CompileCommand) -> StrResult<()> {
-    let mut world = SystemWorld::new(&command)?;
+    let mut world = SystemWorld::new(&command.common)?;
     compile_once(&mut world, &mut command, false)?;
     Ok(())
 }
@@ -43,22 +42,31 @@ pub fn compile_once(
         Status::Compiling.print(command).unwrap();
     }
 
-    // Reset everything and ensure that the main file is still present.
+    // Reset everything and ensure that the main file is present.
     world.reset();
     world.source(world.main()).map_err(|err| err.to_string())?;
 
-    let result = typst::compile(world);
-    let duration = start.elapsed();
+    let mut tracer = Tracer::default();
+    let result = typst::compile(world, &mut tracer);
+    let warnings = tracer.warnings();
 
     match result {
         // Export the PDF / PNG.
         Ok(document) => {
             export(&document, command)?;
+            let duration = start.elapsed();
 
             tracing::info!("Compilation succeeded in {duration:?}");
             if watching {
-                Status::Success(duration).print(command).unwrap();
+                if warnings.is_empty() {
+                    Status::Success(duration).print(command).unwrap();
+                } else {
+                    Status::PartialSuccess(duration).print(command).unwrap();
+                }
             }
+
+            print_diagnostics(world, &[], &warnings, command.common.diagnostic_format)
+                .map_err(|_| "failed to print diagnostics")?;
 
             if let Some(open) = command.open.take() {
                 open_file(open.as_deref(), &command.output())?;
@@ -74,8 +82,13 @@ pub fn compile_once(
                 Status::Error.print(command).unwrap();
             }
 
-            print_diagnostics(world, *errors, command.diagnostic_format)
-                .map_err(|_| "failed to print diagnostics")?;
+            print_diagnostics(
+                world,
+                &errors,
+                &warnings,
+                command.common.diagnostic_format,
+            )
+            .map_err(|_| "failed to print diagnostics")?;
         }
     }
 
@@ -85,7 +98,12 @@ pub fn compile_once(
 /// Export into the target format.
 fn export(document: &Document, command: &CompileCommand) -> StrResult<()> {
     match command.output().extension() {
-        Some(ext) if ext.eq_ignore_ascii_case("png") => export_png(document, command),
+        Some(ext) if ext.eq_ignore_ascii_case("png") => {
+            export_image(document, command, ImageExportFormat::Png)
+        }
+        Some(ext) if ext.eq_ignore_ascii_case("svg") => {
+            export_image(document, command, ImageExportFormat::Svg)
+        }
         _ => export_pdf(document, command),
     }
 }
@@ -98,14 +116,24 @@ fn export_pdf(document: &Document, command: &CompileCommand) -> StrResult<()> {
     Ok(())
 }
 
+/// An image format to export in.
+enum ImageExportFormat {
+    Png,
+    Svg,
+}
+
 /// Export to one or multiple PNGs.
-fn export_png(document: &Document, command: &CompileCommand) -> StrResult<()> {
+fn export_image(
+    document: &Document,
+    command: &CompileCommand,
+    fmt: ImageExportFormat,
+) -> StrResult<()> {
     // Determine whether we have a `{n}` numbering.
     let output = command.output();
     let string = output.to_str().unwrap_or_default();
     let numbered = string.contains("{n}");
     if !numbered && document.pages.len() > 1 {
-        bail!("cannot export multiple PNGs without `{{n}}` in output path");
+        bail!("cannot export multiple images without `{{n}}` in output path");
     }
 
     // Find a number width that accommodates all pages. For instance, the
@@ -115,14 +143,23 @@ fn export_png(document: &Document, command: &CompileCommand) -> StrResult<()> {
     let mut storage;
 
     for (i, frame) in document.pages.iter().enumerate() {
-        let pixmap = typst::export::render(frame, command.ppi / 72.0, Color::WHITE);
         let path = if numbered {
             storage = string.replace("{n}", &format!("{:0width$}", i + 1));
             Path::new(&storage)
         } else {
             output.as_path()
         };
-        pixmap.save_png(path).map_err(|_| "failed to write PNG file")?;
+        match fmt {
+            ImageExportFormat::Png => {
+                let pixmap =
+                    typst::export::render(frame, command.ppi / 72.0, Color::WHITE);
+                pixmap.save_png(path).map_err(|_| "failed to write PNG file")?;
+            }
+            ImageExportFormat::Svg => {
+                let svg = typst::export::svg(frame);
+                fs::write(path, svg).map_err(|_| "failed to write SVG file")?;
+            }
+        }
     }
 
     Ok(())
@@ -142,9 +179,10 @@ fn open_file(open: Option<&str>, path: &Path) -> StrResult<()> {
 }
 
 /// Print diagnostic messages to the terminal.
-fn print_diagnostics(
+pub fn print_diagnostics(
     world: &SystemWorld,
-    errors: Vec<SourceError>,
+    errors: &[SourceDiagnostic],
+    warnings: &[SourceDiagnostic],
     diagnostic_format: DiagnosticFormat,
 ) -> Result<(), codespan_reporting::files::Error> {
     let mut w = match diagnostic_format {
@@ -157,26 +195,31 @@ fn print_diagnostics(
         config.display_style = term::DisplayStyle::Short;
     }
 
-    for error in errors {
-        // The main diagnostic.
-        let diag = Diagnostic::error()
-            .with_message(error.message)
-            .with_notes(
-                error
-                    .hints
-                    .iter()
-                    .map(|e| (eco_format!("hint: {e}")).into())
-                    .collect(),
-            )
-            .with_labels(vec![Label::primary(error.span.id(), error.span.range(world))]);
+    for diagnostic in warnings.iter().chain(errors.iter()) {
+        let diag = match diagnostic.severity {
+            Severity::Error => Diagnostic::error(),
+            Severity::Warning => Diagnostic::warning(),
+        }
+        .with_message(diagnostic.message.clone())
+        .with_notes(
+            diagnostic
+                .hints
+                .iter()
+                .map(|e| (eco_format!("hint: {e}")).into())
+                .collect(),
+        )
+        .with_labels(vec![Label::primary(
+            diagnostic.span.id(),
+            world.range(diagnostic.span),
+        )]);
 
         term::emit(&mut w, &config, world, &diag)?;
 
         // Stacktrace-like helper diagnostics.
-        for point in error.trace {
+        for point in &diagnostic.trace {
             let message = point.v.to_string();
             let help = Diagnostic::help().with_message(message).with_labels(vec![
-                Label::primary(point.span.id(), point.span.range(world)),
+                Label::primary(point.span.id(), world.range(point.span)),
             ]);
 
             term::emit(&mut w, &config, world, &help)?;

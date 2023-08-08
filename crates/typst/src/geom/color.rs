@@ -1,6 +1,9 @@
+use ecow::{eco_format, EcoString};
 use std::str::FromStr;
 
 use super::*;
+use crate::diag::bail;
+use crate::eval::{cast, Array, Cast};
 
 /// A color in a dynamic format.
 #[derive(Copy, Clone, Eq, PartialEq, Hash)]
@@ -68,6 +71,31 @@ impl Color {
             Self::Cmyk(cmyk) => Self::Cmyk(cmyk.negate()),
         }
     }
+
+    /// Mixes multiple colors through weight.
+    pub fn mix(
+        colors: impl IntoIterator<Item = WeightedColor>,
+        space: ColorSpace,
+    ) -> StrResult<Color> {
+        let mut total = 0.0;
+        let mut acc = [0.0; 4];
+
+        for WeightedColor(color, weight) in colors.into_iter() {
+            let v = rgba_to_vec4(color.to_rgba(), space);
+            acc[0] += weight * v[0];
+            acc[1] += weight * v[1];
+            acc[2] += weight * v[2];
+            acc[3] += weight * v[3];
+            total += weight;
+        }
+
+        if total <= 0.0 {
+            bail!("sum of weights must be positive");
+        }
+
+        let mixed = acc.map(|v| v / total);
+        Ok(vec4_to_rgba(mixed, space).into())
+    }
 }
 
 impl Debug for Color {
@@ -78,6 +106,74 @@ impl Debug for Color {
             Self::Cmyk(c) => Debug::fmt(c, f),
         }
     }
+}
+
+/// A color with a weight.
+pub struct WeightedColor(Color, f32);
+
+cast! {
+    WeightedColor,
+    v: Color => Self(v, 1.0),
+    v: Array => {
+        let mut iter = v.into_iter();
+        match (iter.next(), iter.next(), iter.next()) {
+            (Some(c), Some(w), None) => Self(c.cast()?, w.cast::<Weight>()?.0),
+            _ => bail!("expected a color or color-weight pair"),
+        }
+    }
+}
+
+/// A weight for color mixing.
+struct Weight(f32);
+
+cast! {
+    Weight,
+    v: f64 => Self(v as f32),
+    v: Ratio => Self(v.get() as f32),
+}
+
+/// Convert an RGBA color to four components in the given color space.
+fn rgba_to_vec4(color: RgbaColor, space: ColorSpace) -> [f32; 4] {
+    match space {
+        ColorSpace::Oklab => {
+            let RgbaColor { r, g, b, a } = color;
+            let oklab = oklab::srgb_to_oklab(oklab::RGB { r, g, b });
+            [oklab.l, oklab.a, oklab.b, a as f32 / 255.0]
+        }
+        ColorSpace::Srgb => {
+            let RgbaColor { r, g, b, a } = color;
+            [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a as f32 / 255.0]
+        }
+    }
+}
+
+/// Convert four components in the given color space to RGBA.
+fn vec4_to_rgba(vec: [f32; 4], space: ColorSpace) -> RgbaColor {
+    match space {
+        ColorSpace::Oklab => {
+            let [l, a, b, alpha] = vec;
+            let oklab::RGB { r, g, b } = oklab::oklab_to_srgb(oklab::Oklab { l, a, b });
+            RgbaColor { r, g, b, a: (alpha * 255.0).round() as u8 }
+        }
+        ColorSpace::Srgb => {
+            let [r, g, b, a] = vec;
+            RgbaColor {
+                r: (r * 255.0).round() as u8,
+                g: (g * 255.0).round() as u8,
+                b: (b * 255.0).round() as u8,
+                a: (a * 255.0).round() as u8,
+            }
+        }
+    }
+}
+
+/// A color space for mixing.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Cast)]
+pub enum ColorSpace {
+    /// A perceptual color space.
+    Oklab,
+    /// The standard RGB color space.
+    Srgb,
 }
 
 /// An 8-bit grayscale color.
@@ -192,6 +288,20 @@ impl RgbaColor {
             a: self.a,
         }
     }
+
+    /// Converts this color to a RGB Hex Code.
+    pub fn to_hex(self) -> EcoString {
+        if self.a != 255 {
+            eco_format!("#{:02x}{:02x}{:02x}{:02x}", self.r, self.g, self.b, self.a)
+        } else {
+            eco_format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
+        }
+    }
+
+    /// Converts this color to an array of R, G, B, A components.
+    pub fn to_array(self) -> Array {
+        array![self.r, self.g, self.b, self.a]
+    }
 }
 
 impl FromStr for RgbaColor {
@@ -240,11 +350,7 @@ impl Debug for RgbaColor {
         if f.alternate() {
             write!(f, "rgba({}, {}, {}, {})", self.r, self.g, self.b, self.a,)?;
         } else {
-            write!(f, "rgb(\"#{:02x}{:02x}{:02x}", self.r, self.g, self.b)?;
-            if self.a != 255 {
-                write!(f, "{:02x}", self.a)?;
-            }
-            write!(f, "\")")?;
+            write!(f, "rgb(\"{}\")", self.to_hex())?;
         }
         Ok(())
     }
@@ -325,6 +431,13 @@ impl CmykColor {
             k: self.k,
         }
     }
+
+    /// Converts this color to an array of C, M, Y, K components.
+    pub fn to_array(self) -> Array {
+        // convert to ratio
+        let g = |c| Ratio::new(c as f64 / 255.0);
+        array![g(self.c), g(self.m), g(self.y), g(self.k)]
+    }
 }
 
 impl Debug for CmykColor {
@@ -345,6 +458,11 @@ impl From<CmykColor> for Color {
     fn from(cmyk: CmykColor) -> Self {
         Self::Cmyk(cmyk)
     }
+}
+
+cast! {
+    CmykColor,
+    self => Value::Color(self.into()),
 }
 
 /// Convert to the closest u8.

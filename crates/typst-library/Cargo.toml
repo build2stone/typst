@@ -24,7 +24,7 @@ comemo = "0.3"
 csv = "1"
 ecow = "0.1"
 hayagriva = { git = "https://github.com/build2stone/hayagriva", branch = "de" }
-hypher = "0.1"
+hypher = "0.1.2"
 icu_properties = { version = "1.2.0", features = ["serde"] }
 icu_provider = { version = "1.2.0", features = ["sync"] }
 icu_provider_adapters = "1.2.0"
@@ -39,7 +39,7 @@ rustybuzz = "0.7"
 serde_json = "1"
 serde_yaml = "0.8"
 smallvec = "1.10"
-syntect = { version = "5", default-features = false, features = ["parsing", "regex-fancy"] }
+syntect = { version = "5", default-features = false, features = ["parsing", "regex-fancy", "plist-load", "yaml-load"] }
 time = { version = "0.3.20", features = ["formatting"] }
 toml = { version = "0.7.3", default-features = false, features = ["parse"] }
 tracing = "0.1.37"

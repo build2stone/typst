@@ -1,4 +1,5 @@
 pub use typst_macros::{cast, Cast};
+use unicode_math_class::MathClass;
 
 use std::fmt::Write;
 use std::ops::Add;
@@ -280,13 +281,17 @@ impl Add for CastInfo {
     }
 }
 
-/// A container for a variadic argument.
-pub trait Variadics {
+/// A container for an argument.
+pub trait Container {
     /// The contained type.
     type Inner;
 }
 
-impl<T> Variadics for Vec<T> {
+impl<T> Container for Option<T> {
+    type Inner = T;
+}
+
+impl<T> Container for Vec<T> {
     type Inner = T;
 }
 
@@ -313,4 +318,45 @@ impl FromValue for Never {
     fn from_value(value: Value) -> StrResult<Self> {
         Err(Self::error(&value))
     }
+}
+
+cast! {
+    MathClass,
+    self => IntoValue::into_value(match self {
+        MathClass::Normal => "normal",
+        MathClass::Alphabetic => "alphabetic",
+        MathClass::Binary => "binary",
+        MathClass::Closing => "closing",
+        MathClass::Diacritic => "diacritic",
+        MathClass::Fence => "fence",
+        MathClass::GlyphPart => "glyph-part",
+        MathClass::Large => "large",
+        MathClass::Opening => "opening",
+        MathClass::Punctuation => "punctuation",
+        MathClass::Relation => "relation",
+        MathClass::Space => "space",
+        MathClass::Unary => "unary",
+        MathClass::Vary => "vary",
+        MathClass::Special => "special",
+    }),
+    /// The default class for non-special things.
+    "normal" => MathClass::Normal,
+    /// Punctuation, e.g. a comma.
+    "punctuation" => MathClass::Punctuation,
+    /// An opening delimiter, e.g. `(`.
+    "opening" => MathClass::Opening,
+    /// A closing delimiter, e.g. `)`.
+    "closing" => MathClass::Closing,
+    /// A delimiter that is the same on both sides, e.g. `|`.
+    "fence" => MathClass::Fence,
+    /// A large operator like `sum`.
+    "large" => MathClass::Large,
+    /// A relation like `=` or `prec`.
+    "relation" => MathClass::Relation,
+    /// A unary operator like `not`.
+    "unary" => MathClass::Unary,
+    /// A binary operator like `times`.
+    "binary" => MathClass::Binary,
+    /// An operator that can be both unary or binary like `+`.
+    "vary" => MathClass::Vary,
 }

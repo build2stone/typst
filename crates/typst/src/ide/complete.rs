@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashSet};
 
 use ecow::{eco_format, EcoString};
@@ -7,7 +8,9 @@ use unscanny::Scanner;
 use super::analyze::analyze_labels;
 use super::{analyze_expr, analyze_import, plain_docs_sentence, summarize_font_family};
 use crate::doc::Frame;
-use crate::eval::{format_str, methods_on, CastInfo, Library, Scope, Value};
+use crate::eval::{
+    fields_on, format_str, methods_on, CastInfo, Func, Library, Scope, Value,
+};
 use crate::syntax::{
     ast, is_id_continue, is_id_start, is_ident, LinkedNode, Source, SyntaxKind,
 };
@@ -360,6 +363,20 @@ fn field_access_completions(ctx: &mut CompletionContext, value: &Value) {
         })
     }
 
+    for &field in fields_on(value.type_name()) {
+        // Complete the field name along with its value. Notes:
+        // 1. No parentheses since function fields cannot currently be called
+        // with method syntax;
+        // 2. We can unwrap the field's value since it's a field belonging to
+        // this value's type, so accessing it should not fail.
+        ctx.value_completion(
+            Some(field.into()),
+            &value.field(field).unwrap(),
+            false,
+            None,
+        );
+    }
+
     match value {
         Value::Symbol(symbol) => {
             for modifier in symbol.modifiers() {
@@ -410,10 +427,12 @@ fn complete_imports(ctx: &mut CompletionContext) -> bool {
             Some(SyntaxKind::ModuleImport | SyntaxKind::ModuleInclude)
         );
         if let Some(ast::Expr::Str(str)) = ctx.leaf.cast();
-        if str.get().starts_with('@');
+        let value = str.get();
+        if value.starts_with('@');
         then {
+            let all_versions = value.contains(':');
             ctx.from = ctx.leaf.offset();
-            ctx.package_completions();
+            ctx.package_completions(all_versions);
             return true;
         }
     }
@@ -589,7 +608,7 @@ fn complete_params(ctx: &mut CompletionContext) -> bool {
         if let Some(grand) = parent.parent();
         if let Some(expr) = grand.cast::<ast::Expr>();
         let set = matches!(expr, ast::Expr::Set(_));
-        if let Some(ast::Expr::Ident(callee)) = match expr {
+        if let Some(callee) = match expr {
             ast::Expr::FuncCall(call) => Some(call.callee()),
             ast::Expr::Set(set) => Some(set.target()),
             _ => None,
@@ -652,16 +671,12 @@ fn complete_params(ctx: &mut CompletionContext) -> bool {
 /// Add completions for the parameters of a function.
 fn param_completions(
     ctx: &mut CompletionContext,
-    callee: &ast::Ident,
+    callee: &ast::Expr,
     set: bool,
     exclude: &[ast::Ident],
 ) {
-    let info = if_chain! {
-        if let Some(Value::Func(func)) = ctx.global.get(callee);
-        if let Some(info) = func.info();
-        then { info }
-        else { return; }
-    };
+    let Some(func) = resolve_global_callee(ctx, callee) else { return };
+    let Some(info) = func.info() else { return };
 
     for param in &info.params {
         if exclude.iter().any(|ident| ident.as_str() == param.name) {
@@ -694,26 +709,47 @@ fn param_completions(
 /// Add completions for the values of a named function parameter.
 fn named_param_value_completions(
     ctx: &mut CompletionContext,
-    callee: &ast::Ident,
+    callee: &ast::Expr,
     name: &str,
 ) {
-    let param = if_chain! {
-        if let Some(Value::Func(func)) = ctx.global.get(callee);
-        if let Some(info) = func.info();
-        if let Some(param) = info.param(name);
-        if param.named;
-        then { param }
-        else { return; }
-    };
+    let Some(func) = resolve_global_callee(ctx, callee) else { return };
+    let Some(info) = func.info() else { return };
+    let Some(param) = info.param(name) else { return };
+    if !param.named {
+        return;
+    }
 
     ctx.cast_completions(&param.cast);
-
-    if callee.as_str() == "text" && name == "font" {
+    if name == "font" {
         ctx.font_completions();
     }
 
     if ctx.before.ends_with(':') {
         ctx.enrich(" ", "");
+    }
+}
+
+/// Resolve a callee expression to a global function.
+fn resolve_global_callee<'a>(
+    ctx: &CompletionContext<'a>,
+    callee: &ast::Expr,
+) -> Option<&'a Func> {
+    let value = match callee {
+        ast::Expr::Ident(ident) => ctx.global.get(ident)?,
+        ast::Expr::FieldAccess(access) => match access.target() {
+            ast::Expr::Ident(target) => match ctx.global.get(&target)? {
+                Value::Module(module) => module.get(&access.field()).ok()?,
+                Value::Func(func) => func.get(&access.field()).ok()?,
+                _ => return None,
+            },
+            _ => return None,
+        },
+        _ => return None,
+    };
+
+    match value {
+        Value::Func(func) => Some(func),
+        _ => None,
     }
 }
 
@@ -832,7 +868,7 @@ fn code_completions(ctx: &mut CompletionContext, hashtag: bool) {
 
     ctx.snippet_completion(
         "for loop (with key)",
-        "for ${key}, ${value} in ${(a: 1, b: 2)} {\n\t${}\n}",
+        "for (${key}, ${value}) in ${(a: 1, b: 2)} {\n\t${}\n}",
         "Computes or inserts something for each key and value in a collection.",
     );
 
@@ -879,13 +915,13 @@ fn code_completions(ctx: &mut CompletionContext, hashtag: bool) {
     );
 
     ctx.snippet_completion(
-        "array",
+        "array literal",
         "(${1, 2, 3})",
         "Creates a sequence of values.",
     );
 
     ctx.snippet_completion(
-        "dictionary",
+        "dictionary literal",
         "(${a: 1, b: 2})",
         "Creates a mapping from names to value.",
     );
@@ -989,8 +1025,13 @@ impl<'a> CompletionContext<'a> {
     }
 
     /// Add completions for all available packages.
-    fn package_completions(&mut self) {
-        for (package, description) in self.world.packages() {
+    fn package_completions(&mut self, all_versions: bool) {
+        let mut packages: Vec<_> = self.world.packages().iter().collect();
+        packages.sort_by_key(|(spec, _)| (&spec.name, Reverse(spec.version)));
+        if !all_versions {
+            packages.dedup_by_key(|(spec, _)| &spec.name);
+        }
+        for (package, description) in packages {
             self.value_completion(
                 None,
                 &Value::Str(format_str!("{package}")),
@@ -1042,14 +1083,8 @@ impl<'a> CompletionContext<'a> {
         parens: bool,
         docs: Option<&str>,
     ) {
+        let at = label.as_deref().map_or(false, |field| !is_ident(field));
         let label = label.unwrap_or_else(|| value.repr().into());
-        let mut apply = None;
-
-        if label.starts_with('"') && self.after.starts_with('"') {
-            if let Some(trimmed) = label.strip_suffix('"') {
-                apply = Some(trimmed.into());
-            }
-        }
 
         let detail = docs.map(Into::into).or_else(|| match value {
             Value::Symbol(_) => None,
@@ -1060,8 +1095,15 @@ impl<'a> CompletionContext<'a> {
             }
         });
 
+        let mut apply = None;
         if parens && matches!(value, Value::Func(_)) {
             apply = Some(eco_format!("{label}(${{}})"));
+        } else if at {
+            apply = Some(eco_format!("at(\"{label}\")"));
+        } else if label.starts_with('"') && self.after.starts_with('"') {
+            if let Some(trimmed) = label.strip_suffix('"') {
+                apply = Some(trimmed.into());
+            }
         }
 
         self.completions.push(Completion {

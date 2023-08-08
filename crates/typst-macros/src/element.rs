@@ -433,7 +433,7 @@ fn create_param_info(field: &Field) -> TokenStream {
         }
     }));
     let ty = if *variadic {
-        quote! { <#ty as ::typst::eval::Variadics>::Inner }
+        quote! { <#ty as ::typst::eval::Container>::Inner }
     } else {
         quote! { #ty }
     };
@@ -523,6 +523,7 @@ fn create_set_impl(element: &Elem) -> TokenStream {
     quote! {
         impl ::typst::model::Set for #ident {
             fn set(
+                vm: &mut Vm,
                 args: &mut ::typst::eval::Args,
             ) -> ::typst::diag::SourceResult<::typst::model::Styles> {
                 let mut styles = ::typst::model::Styles::new();

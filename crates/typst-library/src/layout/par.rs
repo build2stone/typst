@@ -119,11 +119,11 @@ pub struct ParElem {
 }
 
 impl Construct for ParElem {
-    fn construct(_: &mut Vm, args: &mut Args) -> SourceResult<Content> {
+    fn construct(vm: &mut Vm, args: &mut Args) -> SourceResult<Content> {
         // The paragraph constructor is special: It doesn't create a paragraph
         // element. Instead, it just ensures that the passed content lives in a
         // separate paragraph and styles it.
-        let styles = Self::set(args)?;
+        let styles = Self::set(vm, args)?;
         let body = args.expect::<Content>("body")?;
         Ok(Content::sequence([
             ParbreakElem::new().pack(),
@@ -598,7 +598,11 @@ fn collect<'a>(
             if SmartQuoteElem::enabled_in(styles) {
                 let lang = TextElem::lang_in(styles);
                 let region = TextElem::region_in(styles);
-                let quotes = Quotes::from_lang(lang, region);
+                let quotes = Quotes::from_lang(
+                    lang,
+                    region,
+                    SmartQuoteElem::alternative_in(styles),
+                );
                 let peeked = iter.peek().and_then(|child| {
                     let child = if let Some((child, _)) = child.to_styled() {
                         child
@@ -746,6 +750,7 @@ fn shape_range<'a>(
     spans: &SpanMapper,
     styles: StyleChain<'a>,
 ) {
+    let script = TextElem::script_in(styles);
     let lang = TextElem::lang_in(styles);
     let region = TextElem::region_in(styles);
     let mut process = |range: Range, level: BidiLevel| {
@@ -759,25 +764,31 @@ fn shape_range<'a>(
     let mut prev_script = Script::Unknown;
     let mut cursor = range.start;
 
-    // Group by embedding level and script.
+    // Group by embedding level and script.  If the text's script is explicitly
+    // set (rather than inferred from the glpyhs), we keep the script at an
+    // unchanging `Script::Unknown` so that only level changes cause breaks.
     for i in range.clone() {
         if !bidi.text.is_char_boundary(i) {
             continue;
         }
 
         let level = bidi.levels[i];
-        let script =
-            bidi.text[i..].chars().next().map_or(Script::Unknown, |c| c.script());
+        let curr_script = match script {
+            Smart::Auto => {
+                bidi.text[i..].chars().next().map_or(Script::Unknown, |c| c.script())
+            }
+            Smart::Custom(_) => Script::Unknown,
+        };
 
-        if level != prev_level || !is_compatible(script, prev_script) {
+        if level != prev_level || !is_compatible(curr_script, prev_script) {
             if cursor < i {
                 process(cursor..i, prev_level);
             }
             cursor = i;
             prev_level = level;
-            prev_script = script;
+            prev_script = curr_script;
         } else if is_generic_script(prev_script) {
-            prev_script = script;
+            prev_script = curr_script;
         }
     }
 
@@ -897,6 +908,7 @@ fn linebreak_optimized<'a>(vt: &Vt, p: &'a Preparation<'a>, width: Abs) -> Vec<L
 
     // Cost parameters.
     const HYPH_COST: Cost = 0.5;
+    const RUNT_COST: Cost = 0.5;
     const CONSECUTIVE_DASH_COST: Cost = 300.0;
     const MAX_COST: Cost = 1_000_000.0;
     const MIN_RATIO: f64 = -1.0;
@@ -972,6 +984,11 @@ fn linebreak_optimized<'a>(vt: &Vt, p: &'a Preparation<'a>, width: Abs) -> Vec<L
                 // Normal line with cost of |ratio^3|.
                 ratio.powi(3).abs()
             };
+
+            // Penalize runts.
+            if k == i + 1 && eof {
+                cost += RUNT_COST;
+            }
 
             // Penalize hyphens.
             if hyphen {
@@ -1333,7 +1350,9 @@ fn finalize(
     let width = if !region.x.is_finite()
         || (!expand && lines.iter().all(|line| line.fr().is_zero()))
     {
-        p.hang + lines.iter().map(|line| line.width).max().unwrap_or_default()
+        region
+            .x
+            .min(p.hang + lines.iter().map(|line| line.width).max().unwrap_or_default())
     } else {
         region.x
     };

@@ -7,21 +7,29 @@ use unicode_math_class::MathClass;
 use super::{ast, is_newline, LexMode, Lexer, SyntaxKind, SyntaxNode};
 
 /// Parse a source file.
+#[tracing::instrument(skip_all)]
 pub fn parse(text: &str) -> SyntaxNode {
     let mut p = Parser::new(text, 0, LexMode::Markup);
     markup(&mut p, true, 0, |_| false);
     p.finish().into_iter().next().unwrap()
 }
 
-/// Parse code directly.
-///
-/// This is only used for syntax highlighting.
+/// Parse top-level code.
+#[tracing::instrument(skip_all)]
 pub fn parse_code(text: &str) -> SyntaxNode {
     let mut p = Parser::new(text, 0, LexMode::Code);
     let m = p.marker();
     p.skip();
     code_exprs(&mut p, |_| false);
-    p.wrap_skipless(m, SyntaxKind::Code);
+    p.wrap_all(m, SyntaxKind::Code);
+    p.finish().into_iter().next().unwrap()
+}
+
+/// Parse top-level math.
+#[tracing::instrument(skip_all)]
+pub fn parse_math(text: &str) -> SyntaxNode {
+    let mut p = Parser::new(text, 0, LexMode::Math);
+    math(&mut p, |_| false);
     p.finish().into_iter().next().unwrap()
 }
 
@@ -171,8 +179,8 @@ fn heading(p: &mut Parser) {
 
 fn list_item(p: &mut Parser) {
     let m = p.marker();
+    let min_indent = p.column(p.current_start()) + 1;
     p.assert(SyntaxKind::ListMarker);
-    let min_indent = p.column(p.prev_end());
     whitespace_line(p);
     markup(p, false, min_indent, |p| p.at(SyntaxKind::RightBracket));
     p.wrap(m, SyntaxKind::ListItem);
@@ -180,8 +188,8 @@ fn list_item(p: &mut Parser) {
 
 fn enum_item(p: &mut Parser) {
     let m = p.marker();
+    let min_indent = p.column(p.current_start()) + 1;
     p.assert(SyntaxKind::EnumMarker);
-    let min_indent = p.column(p.prev_end());
     whitespace_line(p);
     markup(p, false, min_indent, |p| p.at(SyntaxKind::RightBracket));
     p.wrap(m, SyntaxKind::EnumItem);
@@ -295,6 +303,18 @@ fn math_expr_prec(p: &mut Parser, min_prec: usize, stop: SyntaxKind) {
             }
         }
 
+        SyntaxKind::Prime => {
+            // Means that there is nothing to attach the prime to.
+            continuable = true;
+            while p.at(SyntaxKind::Prime) {
+                let m2 = p.marker();
+                p.eat();
+                // Eat the group until the space.
+                while p.eat_if_direct(SyntaxKind::Prime) {}
+                p.wrap(m2, SyntaxKind::MathPrimes);
+            }
+        }
+
         _ => p.expected("expression"),
     }
 
@@ -306,6 +326,9 @@ fn math_expr_prec(p: &mut Parser, min_prec: usize, stop: SyntaxKind) {
         p.wrap(m, SyntaxKind::Math);
     }
 
+    // Whether there were _any_ primes in the loop.
+    let mut primed = false;
+
     while !p.eof() && !p.at(stop) {
         if p.directly_at(SyntaxKind::Text) && p.current_text() == "!" {
             p.eat();
@@ -313,9 +336,38 @@ fn math_expr_prec(p: &mut Parser, min_prec: usize, stop: SyntaxKind) {
             continue;
         }
 
+        let prime_marker = p.marker();
+        if p.eat_if_direct(SyntaxKind::Prime) {
+            // Eat as many primes as possible.
+            while p.eat_if_direct(SyntaxKind::Prime) {}
+            p.wrap(prime_marker, SyntaxKind::MathPrimes);
+
+            // Will not be continued, so need to wrap the prime as attachment.
+            if p.at(stop) {
+                p.wrap(m, SyntaxKind::MathAttach);
+            }
+
+            primed = true;
+            continue;
+        }
+
+        // Separate primes and superscripts to different attachments.
+        if primed && p.current() == SyntaxKind::Hat {
+            p.wrap(m, SyntaxKind::MathAttach);
+        }
+
         let Some((kind, stop, assoc, mut prec)) = math_op(p.current()) else {
+            // No attachments, so we need to wrap primes as attachment.
+            if primed {
+                p.wrap(m, SyntaxKind::MathAttach);
+            }
+
             break;
         };
+
+        if primed && kind == SyntaxKind::MathFrac {
+            p.wrap(m, SyntaxKind::MathAttach);
+        }
 
         if prec < min_prec {
             break;
@@ -335,7 +387,7 @@ fn math_expr_prec(p: &mut Parser, min_prec: usize, stop: SyntaxKind) {
         math_expr_prec(p, prec, stop);
         math_unparen(p, m2);
 
-        if p.eat_if(SyntaxKind::Underscore) || p.eat_if(SyntaxKind::Hat) {
+        if p.eat_if(SyntaxKind::Underscore) || (!primed && p.eat_if(SyntaxKind::Hat)) {
             let m3 = p.marker();
             math_expr_prec(p, prec, SyntaxKind::Eof);
             math_unparen(p, m3);
@@ -567,9 +619,13 @@ fn embedded_code_expr(p: &mut Parser) {
     let prev = p.prev_end();
     code_expr_prec(p, true, 0, false);
 
-    // Consume error for things like `#12p` or `#"abc\"`.
+    // Consume error for things like `#12p` or `#"abc\"`.#
     if !p.progress(prev) {
-        p.unexpected();
+        if p.current().is_trivia() {
+            // p.unskip();
+        } else if !p.eof() {
+            p.unexpected();
+        }
     }
 
     let semi =
@@ -1021,9 +1077,7 @@ fn set_rule(p: &mut Parser) {
 fn show_rule(p: &mut Parser) {
     let m = p.marker();
     p.assert(SyntaxKind::Show);
-    p.unskip();
-    let m2 = p.marker();
-    p.skip();
+    let m2 = p.before_trivia();
 
     if !p.at(SyntaxKind::Colon) {
         code_expr(p);
@@ -1066,7 +1120,8 @@ fn for_loop(p: &mut Parser) {
     p.assert(SyntaxKind::For);
     pattern(p);
     if p.at(SyntaxKind::Comma) {
-        p.expected("keyword `in` - did you mean to use a destructuring pattern?");
+        p.expected("keyword `in`");
+        p.hint("did you mean to use a destructuring pattern?");
         if !p.eat_if(SyntaxKind::Ident) {
             p.eat_if(SyntaxKind::Underscore);
         }
@@ -1193,7 +1248,8 @@ fn validate_dict<'a>(children: impl Iterator<Item = &'a mut SyntaxNode>) {
             SyntaxKind::LeftParen
             | SyntaxKind::RightParen
             | SyntaxKind::Comma
-            | SyntaxKind::Colon => {}
+            | SyntaxKind::Colon
+            | SyntaxKind::Space => {}
             kind => {
                 child.convert_to_error(eco_format!(
                     "expected named or keyed pair, found {}",
@@ -1448,8 +1504,21 @@ impl<'s> Parser<'s> {
         self.current == kind && self.prev_end == self.current_start
     }
 
+    /// Eats if at `kind`.
+    ///
+    /// Note: In math and code mode, this will ignore trivia in front of the
+    /// `kind`, To forbid skipping trivia, consider using `eat_if_direct`.
     fn eat_if(&mut self, kind: SyntaxKind) -> bool {
         let at = self.at(kind);
+        if at {
+            self.eat();
+        }
+        at
+    }
+
+    /// Eats only if currently at the start of `kind`.
+    fn eat_if_direct(&mut self, kind: SyntaxKind) -> bool {
+        let at = self.directly_at(kind);
         if at {
             self.eat();
         }
@@ -1487,16 +1556,20 @@ impl<'s> Parser<'s> {
             .filter(|child| !child.kind().is_error() && !child.kind().is_trivia())
     }
 
-    fn wrap(&mut self, m: Marker, kind: SyntaxKind) {
-        self.unskip();
-        self.wrap_skipless(m, kind);
-        self.skip();
+    fn wrap(&mut self, from: Marker, kind: SyntaxKind) {
+        self.wrap_within(from, self.before_trivia(), kind);
     }
 
-    fn wrap_skipless(&mut self, m: Marker, kind: SyntaxKind) {
-        let from = m.0.min(self.nodes.len());
-        let children = self.nodes.drain(from..).collect();
-        self.nodes.push(SyntaxNode::inner(kind, children));
+    fn wrap_all(&mut self, from: Marker, kind: SyntaxKind) {
+        self.wrap_within(from, Marker(self.nodes.len()), kind)
+    }
+
+    fn wrap_within(&mut self, from: Marker, to: Marker, kind: SyntaxKind) {
+        let len = self.nodes.len();
+        let to = to.0.min(len);
+        let from = from.0.min(to);
+        let children = self.nodes.drain(from..to).collect();
+        self.nodes.insert(from, SyntaxNode::inner(kind, children));
     }
 
     fn progress(&self, offset: usize) -> bool {
@@ -1582,11 +1655,16 @@ impl<'s> Parser<'s> {
             self.current = SyntaxKind::Eof;
         }
     }
+}
 
+impl<'s> Parser<'s> {
+    /// Consume the given syntax `kind` or produce an error.
     fn expect(&mut self, kind: SyntaxKind) -> bool {
         let at = self.at(kind);
         if at {
             self.eat();
+        } else if kind == SyntaxKind::Ident && self.current.is_keyword() {
+            self.expected_found(kind.name(), self.current.name());
         } else {
             self.balanced &= !kind.is_grouping();
             self.expected(kind.name());
@@ -1594,50 +1672,89 @@ impl<'s> Parser<'s> {
         at
     }
 
-    fn expect_closing_delimiter(&mut self, open: Marker, kind: SyntaxKind) {
-        if !self.eat_if(kind) {
-            self.nodes[open.0].convert_to_error("unclosed delimiter");
-        }
-    }
-
+    /// Produce an error that the given `thing` was expected.
     fn expected(&mut self, thing: &str) {
-        self.unskip();
-        if self
-            .nodes
-            .last()
-            .map_or(true, |child| child.kind() != SyntaxKind::Error)
-        {
-            let message = eco_format!("expected {}", thing);
-            self.nodes.push(SyntaxNode::error(message, ""));
+        if !self.after_error() {
+            self.expected_at(self.before_trivia(), thing);
         }
-        self.skip();
     }
 
+    /// Produce an error that the given `thing` was expected but another
+    /// thing was `found` and consume the next token.
+    fn expected_found(&mut self, thing: &str, found: &str) {
+        self.trim_errors();
+        self.convert_to_error(eco_format!("expected {thing}, found {found}"));
+    }
+
+    /// Produce an error that the given `thing` was expected at the position
+    /// of the marker `m`.
     fn expected_at(&mut self, m: Marker, thing: &str) {
         let message = eco_format!("expected {}", thing);
         let error = SyntaxNode::error(message, "");
         self.nodes.insert(m.0, error);
     }
 
-    fn unexpected(&mut self) {
-        self.unskip();
-        while self
-            .nodes
-            .last()
-            .map_or(false, |child| child.kind() == SyntaxKind::Error && child.is_empty())
-        {
-            self.nodes.pop();
+    /// Produce an error for the unclosed delimiter `kind` at the position
+    /// `open`.
+    fn expect_closing_delimiter(&mut self, open: Marker, kind: SyntaxKind) {
+        if !self.eat_if(kind) {
+            self.nodes[open.0].convert_to_error("unclosed delimiter");
         }
-        self.skip();
+    }
 
+    /// Consume the next token (if any) and produce an error stating that it was
+    /// unexpected.
+    fn unexpected(&mut self) {
+        self.trim_errors();
+        self.convert_to_error(eco_format!("unexpected {}", self.current.name()));
+    }
+
+    /// Consume the next token and turn it into an error.
+    fn convert_to_error(&mut self, message: EcoString) {
         let kind = self.current;
         let offset = self.nodes.len();
         self.eat();
         self.balanced &= !kind.is_grouping();
-
         if !kind.is_error() {
-            self.nodes[offset]
-                .convert_to_error(eco_format!("unexpected {}", kind.name()));
+            self.nodes[offset].convert_to_error(message);
         }
+    }
+
+    /// Adds a hint to the last node, if the last node is an error.
+    fn hint(&mut self, hint: impl Into<EcoString>) {
+        let m = self.before_trivia();
+        if m.0 > 0 {
+            self.nodes[m.0 - 1].hint(hint);
+        }
+    }
+
+    /// Get a marker after the last non-trivia node.
+    fn before_trivia(&self) -> Marker {
+        let mut i = self.nodes.len();
+        if self.lexer.mode() != LexMode::Markup && self.prev_end != self.current_start {
+            while i > 0 && self.nodes[i - 1].kind().is_trivia() {
+                i -= 1;
+            }
+        }
+        Marker(i)
+    }
+
+    /// Whether the last non-trivia node is an error.
+    fn after_error(&mut self) -> bool {
+        let m = self.before_trivia();
+        m.0 > 0 && self.nodes[m.0 - 1].kind().is_error()
+    }
+
+    /// Remove trailing errors with zero length.
+    fn trim_errors(&mut self) {
+        let Marker(end) = self.before_trivia();
+        let mut start = end;
+        while start > 0
+            && self.nodes[start - 1].kind().is_error()
+            && self.nodes[start - 1].is_empty()
+        {
+            start -= 1;
+        }
+        self.nodes.drain(start..end);
     }
 }

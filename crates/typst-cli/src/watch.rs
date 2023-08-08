@@ -17,7 +17,7 @@ use crate::world::SystemWorld;
 /// Execute a watching compilation command.
 pub fn watch(mut command: CompileCommand) -> StrResult<()> {
     // Create the world that serves sources, files, and fonts.
-    let mut world = SystemWorld::new(&command)?;
+    let mut world = SystemWorld::new(&command.common)?;
 
     // Perform initial compilation.
     compile_once(&mut world, &mut command, true)?;
@@ -34,6 +34,7 @@ pub fn watch(mut command: CompileCommand) -> StrResult<()> {
     let timeout = std::time::Duration::from_millis(100);
     let output = command.output();
     loop {
+        let mut removed = HashSet::new();
         let mut recompile = false;
         for event in rx
             .recv()
@@ -41,13 +42,32 @@ pub fn watch(mut command: CompileCommand) -> StrResult<()> {
             .chain(std::iter::from_fn(|| rx.recv_timeout(timeout).ok()))
         {
             let event = event.map_err(|_| "failed to watch directory")?;
+
+            // Workaround for notify-rs' implicit unwatch on remove/rename
+            // (triggered by some editors when saving files) with the inotify
+            // backend. By keeping track of the removed files, we can allow
+            // those we still depend on to be watched again later on.
+            if matches!(
+                event.kind,
+                notify::EventKind::Remove(notify::event::RemoveKind::File)
+            ) {
+                let path = &event.paths[0];
+                removed.insert(path.clone());
+
+                // Remove the watch in case it still exists.
+                watcher.unwatch(path).ok();
+            }
+
             recompile |= is_event_relevant(&event, &output);
         }
 
         if recompile {
             // Retrieve the dependencies of the last compilation.
-            let previous: HashSet<PathBuf> =
-                world.dependencies().map(ToOwned::to_owned).collect();
+            let previous: HashSet<PathBuf> = world
+                .dependencies()
+                .filter(|path| !removed.contains(*path))
+                .map(ToOwned::to_owned)
+                .collect();
 
             // Recompile.
             compile_once(&mut world, &mut command, true)?;
@@ -118,6 +138,7 @@ fn is_event_relevant(event: &notify::Event, output: &Path) -> bool {
 pub enum Status {
     Compiling,
     Success(std::time::Duration),
+    PartialSuccess(std::time::Duration),
     Error,
 }
 
@@ -138,7 +159,7 @@ impl Status {
         w.set_color(&color)?;
         write!(w, "watching")?;
         w.reset()?;
-        writeln!(w, " {}", command.input.display())?;
+        writeln!(w, " {}", command.common.input.display())?;
 
         w.set_color(&color)?;
         write!(w, "writing to")?;
@@ -156,6 +177,9 @@ impl Status {
         match self {
             Self::Compiling => "compiling ...".into(),
             Self::Success(duration) => format!("compiled successfully in {duration:.2?}"),
+            Self::PartialSuccess(duration) => {
+                format!("compiled with warnings in {duration:.2?}")
+            }
             Self::Error => "compiled with errors".into(),
         }
     }
@@ -164,6 +188,7 @@ impl Status {
         let styles = term::Styles::default();
         match self {
             Self::Error => styles.header_error,
+            Self::PartialSuccess(_) => styles.header_warning,
             _ => styles.header_note,
         }
     }

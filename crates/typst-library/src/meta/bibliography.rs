@@ -8,7 +8,8 @@ use hayagriva::io::{BibLaTeXError, YamlBibliographyError};
 use hayagriva::style::{self, Brackets, Citation, Database, DisplayString, Formatting};
 use hayagriva::Entry;
 use typst::diag::FileError;
-use typst::util::{option_eq, Bytes};
+use typst::eval::Bytes;
+use typst::util::option_eq;
 
 use super::{LinkElem, LocalName, RefElem};
 use crate::layout::{BlockElem, GridElem, ParElem, Sizing, TrackSizings, VElem};
@@ -246,6 +247,7 @@ impl LocalName for BibliographyElem {
             Lang::TURKISH => "Kaynakça",
             Lang::UKRAINIAN => "Бібліографія",
             Lang::VIETNAMESE => "Tài liệu tham khảo",
+            Lang::JAPANESE => "参考文献",
             Lang::ENGLISH | _ => "Bibliography",
         }
     }
@@ -604,7 +606,7 @@ fn load(paths: &BibPaths, data: &[Bytes]) -> StrResult<EcoVec<hayagriva::Entry>>
 
     // We might have multiple bib/yaml files
     for (path, bytes) in paths.0.iter().zip(data) {
-        let src = std::str::from_utf8(bytes).map_err(|_| FileError::InvalidUtf8)?;
+        let src = std::str::from_utf8(bytes).map_err(FileError::from)?;
         let entries = parse_bib(path, src)?;
         result.extend(entries);
     }
