@@ -753,7 +753,7 @@ checksum = "2c6201b9ff9fd90a5a3bac2e56a830d0caa509576f0e503818ee82c181b3437a"
 [[package]]
 name = "hayagriva"
 version = "0.3.0"
-source = "git+https://github.com/build2stone/hayagriva?branch=de#a38312846f92e491a89dc13ea5d4101bda68337f"
+source = "git+https://github.com/build2stone/hayagriva?branch=de#b13f29c0cb11176d26b03709dde2ec946fa6980c"
 dependencies = [
  "biblatex",
  "chrono",
