@@ -7,10 +7,11 @@ use if_chain::if_chain;
 use super::analyze::analyze_labels;
 use super::{analyze_expr, plain_docs_sentence, summarize_font_family};
 use crate::doc::Frame;
-use crate::eval::{CastInfo, Tracer, Value};
+use crate::eval::{CapturesVisitor, CastInfo, Tracer, Value};
 use crate::geom::{round_2, Length, Numeric};
-use crate::syntax::{ast, LinkedNode, Source, SyntaxKind};
-use crate::util::pretty_comma_list;
+use crate::syntax::ast::{self, AstNode};
+use crate::syntax::{LinkedNode, Source, SyntaxKind};
+use crate::util::{pretty_comma_list, separated_list};
 use crate::World;
 
 /// Describe the item under the cursor.
@@ -29,6 +30,7 @@ pub fn tooltip(
         .or_else(|| font_tooltip(world, &leaf))
         .or_else(|| ref_tooltip(world, frames, &leaf))
         .or_else(|| expr_tooltip(world, &leaf))
+        .or_else(|| closure_tooltip(&leaf))
 }
 
 /// A hover tooltip.
@@ -73,7 +75,7 @@ fn expr_tooltip(world: &(dyn World + 'static), leaf: &LinkedNode) -> Option<Tool
     let mut last = None;
     let mut pieces: Vec<EcoString> = vec![];
     let mut iter = values.iter();
-    for value in (&mut iter).take(Tracer::MAX - 1) {
+    for value in (&mut iter).take(Tracer::MAX_VALUES - 1) {
         if let Some((prev, count)) = &mut last {
             if *prev == value {
                 *count += 1;
@@ -98,6 +100,32 @@ fn expr_tooltip(world: &(dyn World + 'static), leaf: &LinkedNode) -> Option<Tool
 
     let tooltip = pretty_comma_list(&pieces, false);
     (!tooltip.is_empty()).then(|| Tooltip::Code(tooltip.into()))
+}
+
+/// Tooltip for a hovered closure.
+fn closure_tooltip(leaf: &LinkedNode) -> Option<Tooltip> {
+    // Find the closure to analyze.
+    let mut ancestor = leaf;
+    while !ancestor.is::<ast::Closure>() {
+        ancestor = ancestor.parent()?;
+    }
+    let closure = ancestor.cast::<ast::Closure>()?.to_untyped();
+
+    // Analyze the closure's captures.
+    let mut visitor = CapturesVisitor::new(None);
+    visitor.visit(closure);
+
+    let captures = visitor.finish();
+    let mut names: Vec<_> =
+        captures.iter().map(|(name, _)| eco_format!("`{name}`")).collect();
+    if names.is_empty() {
+        return None;
+    }
+
+    names.sort();
+
+    let tooltip = separated_list(&names, "and");
+    Some(Tooltip::Text(eco_format!("This closure captures {tooltip}.")))
 }
 
 /// Tooltip text for a hovered length.
@@ -138,7 +166,7 @@ fn named_param_tooltip(
     world: &(dyn World + 'static),
     leaf: &LinkedNode,
 ) -> Option<Tooltip> {
-    let (info, named) = if_chain! {
+    let (func, named) = if_chain! {
         // Ensure that we are in a named pair in the arguments to a function
         // call or set rule.
         if let Some(parent) = leaf.parent();
@@ -155,8 +183,7 @@ fn named_param_tooltip(
 
         // Find metadata about the function.
         if let Some(Value::Func(func)) = world.library().global.scope().get(&callee);
-        if let Some(info) = func.info();
-        then { (info, named) }
+        then { (func, named) }
         else { return None; }
     };
 
@@ -164,7 +191,7 @@ fn named_param_tooltip(
     if_chain! {
         if leaf.index() == 0;
         if let Some(ident) = leaf.cast::<ast::Ident>();
-        if let Some(param) = info.param(&ident);
+        if let Some(param) = func.param(&ident);
         then {
             return Some(Tooltip::Text(plain_docs_sentence(param.docs)));
         }
@@ -173,8 +200,8 @@ fn named_param_tooltip(
     // Hovering over a string parameter value.
     if_chain! {
         if let Some(string) = leaf.cast::<ast::Str>();
-        if let Some(param) = info.param(&named.name());
-        if let Some(docs) = find_string_doc(&param.cast, &string.get());
+        if let Some(param) = func.param(&named.name());
+        if let Some(docs) = find_string_doc(&param.input, &string.get());
         then {
             return Some(Tooltip::Text(docs.into()));
         }

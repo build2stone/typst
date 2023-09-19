@@ -115,7 +115,7 @@
 ---
 // Too few arguments.
 #{
-  let types(x, y) = "[" + type(x) + ", " + type(y) + "]"
+  let types(x, y) = "[" + str(type(x)) + ", " + str(type(y)) + "]"
   test(types(14%, 12pt), "[ratio, length]")
 
   // Error: 13-21 missing argument: y
@@ -130,6 +130,24 @@
   // Error: 8-13 unexpected argument
   f(1, "two", () => x)
 }
+
+---
+// Mutable method with capture in argument.
+#let x = "b"
+#let f() = {
+  let a = (b: 5)
+  a.at(x) = 10
+  a
+}
+#f()
+
+---
+#let x = ()
+#let f() = {
+  // Error: 3-4 variables from outside the function are read-only and cannot be modified
+  x.at(1) = 2
+}
+#f()
 
 ---
 // Named arguments.
